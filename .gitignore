@@ -1,0 +1,8 @@
+# Ignore Gogland project files
+/.idea/*
+
+# Ignore VSCode files
+.vscode
+
+# Ignore Mac desktop store files
+.DS_Store
