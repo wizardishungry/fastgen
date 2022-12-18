@@ -65,14 +65,13 @@ func client(sock string, args []string) error {
 		return fmt.Errorf("need more args: label [cmd] [args...]")
 	}
 
+	var (
+		req    any
+		resp   any
+		method = ""
+	)
 	if len(args) == 1 { // start or stop cmd
 		start, wait, err := parseLabel(args[0])
-
-		var (
-			req    any
-			resp   any
-			method = ""
-		)
 
 		if err != nil {
 			return fmt.Errorf("parseLabel: %w", err)
@@ -84,30 +83,28 @@ func client(sock string, args []string) error {
 		}
 		if wait != nil {
 			req = wait
-			resp = &WaitQueueRequest{}
-			method = "Fastgen.WaitQueue"
+			resp = &DoneQueueResponse{}
+			method = "Fastgen.DoneQueue"
 		}
-		return client.Call(method, req, resp)
+	} else {
+		req = &CreateTaskRequest{
+			Task: Task{
+				Cmd: args[1:],
+				// TODO copy env
+			},
+			CreateQueueRequest: CreateQueueRequest{
+				Queue: args[0],
+				Width: 0,
+			},
+		}
+		resp = &CreateTaskResponse{}
+		method = "Fastgen.CreateTask"
 	}
 
-	req := &CreateTaskRequest{
-		Task: Task{
-			Cmd: args[1:],
-			// TODO copy env
-		},
-		CreateQueueRequest: CreateQueueRequest{
-			Queue: args[0],
-			Width: 0,
-		},
-	}
-	var reply CreateTaskResponse
-
-	err = client.Call("Fastgen.CreateTask", req, &reply)
-
-	return err
+	return client.Call(method, req, resp)
 }
 
-func parseLabel(arg string) (*CreateQueueRequest, *WaitQueueRequest, error) {
+func parseLabel(arg string) (*CreateQueueRequest, *DoneQueueRequest, error) {
 	parts := strings.Split(arg, "/")
 
 	var (
@@ -140,11 +137,12 @@ func parseLabel(arg string) (*CreateQueueRequest, *WaitQueueRequest, error) {
 	}
 
 	if len(parts) > 2 {
-		deps = strings.Split(parts[1], ",")
+		deps = strings.Split(parts[2], ",")
+		fmt.Println("deps are ", deps)
 	}
 
 	if isWait {
-		return nil, &WaitQueueRequest{
+		return nil, &DoneQueueRequest{
 			Queue: queueName,
 		}, nil
 	}
@@ -186,7 +184,7 @@ func server(args []string) error {
 	defer func() {
 		fmt.Println("WaitAllQueues")
 
-		err := fg.WaitAllQueues(&WaitQueueRequest{}, &WaitQueueResponse{})
+		err := fg.WaitAllQueues(&WaitAllQueuesRequest{}, &WaitAllQueuesResponse{})
 		fmt.Println("🍕", c.ProcessState.ExitCode(), err)
 	}()
 	return c.Run()
@@ -198,9 +196,7 @@ func serve(l *net.UnixListener) *Fastgen {
 		queues: make(map[string]*queueEntry),
 		tasks:  make(chan func()),
 	}
-
 	rpc.Register(fg)
-	go rpc.Accept(l)
 
 	go func() {
 		for {
@@ -222,6 +218,8 @@ func (fg *Fastgen) consumeTasks() {
 	defer wg.Wait()
 	numWorkers := runtime.NumCPU() // TODO
 	wg.Add(numWorkers)
+	// TODO restructure to use semaphores and new goroutines
+	// detect deadlocks?
 	for i := 0; i < numWorkers; i++ {
 		go func() {
 			defer wg.Done()
@@ -331,7 +329,12 @@ func (fg *Fastgen) serveQueue(q *queueEntry, qn string) {
 			once.Do(func() { go fg.executeQueue(q, qn) })
 		}
 
+		fmt.Println("waiting", qn, len(depMap), depMap)
+
 		doneQueueName := <-q.wake
+
+		fmt.Println("got queue", doneQueueName)
+
 		delete(depMap, doneQueueName)
 	}
 }
@@ -411,14 +414,15 @@ func (t *Task) execute() {
 	}
 }
 
-type WaitQueueRequest struct {
+type DoneQueueRequest struct {
 	Queue string
+	Wait  bool
 }
 
-type WaitQueueResponse struct{}
+type DoneQueueResponse struct{}
 
-func (fg *Fastgen) WaitQueue(req *WaitQueueRequest, resp *WaitQueueResponse) error {
-	fmt.Println("WaitQueue", req.Queue)
+func (fg *Fastgen) DoneQueue(req *DoneQueueRequest, resp *DoneQueueResponse) error {
+	fmt.Println("DoneQueue", req.Queue)
 	fg.mutex.Lock()
 	q, found := fg.findCreateQueue(req.Queue, 0, nil)
 	q.tasks = append(q.tasks, Task{done: true})
@@ -426,22 +430,33 @@ func (fg *Fastgen) WaitQueue(req *WaitQueueRequest, resp *WaitQueueResponse) err
 	if !found {
 		return errors.New("can't wait for nonexistant queue")
 	}
-	<-q.done
+	if req.Wait {
+		<-q.done
+	}
 
 	return nil
+
 }
 
-func (fg *Fastgen) WaitAllQueues(req *WaitQueueRequest, resp *WaitQueueResponse) error {
+type WaitAllQueuesRequest struct {
+	Queue     string
+	SkipClose bool
+}
+
+type WaitAllQueuesResponse struct{}
+
+func (fg *Fastgen) WaitAllQueues(req *WaitAllQueuesRequest, resp *WaitAllQueuesResponse) error {
 	fmt.Println("WAQWAQ")
 	fg.mutex.Lock()
 	queues := make([]*queueEntry, 0, len(fg.queues))
 	for _, q := range fg.queues {
 		queues = append(queues, q)
-		q.tasks = append(q.tasks, Task{done: true})
+		if !req.SkipClose {
+			q.tasks = append(q.tasks, Task{done: true})
+		}
 	}
 	fg.mutex.Unlock()
 
-	fmt.Println("range")
 	for _, q := range queues {
 		t := time.Now()
 		<-q.done
