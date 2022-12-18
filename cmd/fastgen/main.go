@@ -405,6 +405,7 @@ func (t *Task) execute() {
 	fmt.Println("run", c)
 	err := c.Run()
 	fmt.Println("done", c)
+
 	if err != nil {
 		log.Panicf("c.Run(): %v", err)
 	}
